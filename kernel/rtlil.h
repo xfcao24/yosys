@@ -47,12 +47,20 @@ namespace RTLIL
 		STi = 7  // init
 	};
 
+	// Semantic metadata - how can this constant be interpreted?
+	// Values may be generally non-exclusive
 	enum ConstFlags : unsigned char {
 		CONST_FLAG_NONE   = 0,
 		CONST_FLAG_STRING = 1,
 		CONST_FLAG_SIGNED = 2,  // only used for parameters
-		CONST_FLAG_REAL   = 4   // only used for parameters
+		CONST_FLAG_REAL   = 4,  // only used for parameters
 	};
+
+	// // Union discriminator. Values are exclusive
+	// enum ConstRepr : unsigned char {
+	// 	CONST_REPR_BITS   = 1,
+	// 	CONST_REPR_STRING = 2,
+	// };
 
 	struct Const;
 	struct AttrObject;
@@ -503,6 +511,7 @@ namespace RTLIL
 	RTLIL::Const const_pow         (const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len);
 
 	RTLIL::Const const_pos         (const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len);
+	RTLIL::Const const_buf         (const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len);
 	RTLIL::Const const_neg         (const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len);
 
 	RTLIL::Const const_mux         (const RTLIL::Const &arg1, const RTLIL::Const &arg2, const RTLIL::Const &arg3);
@@ -657,35 +666,115 @@ namespace RTLIL
 
 struct RTLIL::Const
 {
-	int flags;
-	std::vector<RTLIL::State> bits;
+	short flags;
+private:
+	friend class KernelRtlilTest;
+	FRIEND_TEST(KernelRtlilTest, ConstStr);
+	using bitvectype = std::vector<RTLIL::State>;
+	enum class backing_tag: bool { bits, string };
+	// Do not access the union or tag even in Const methods unless necessary
+	mutable backing_tag tag;
+	union {
+		mutable bitvectype bits_;
+		mutable std::string str_;
+	};
 
-	Const() : flags(RTLIL::CONST_FLAG_NONE) {}
+	// Use these private utilities instead
+	bool is_bits() const { return tag == backing_tag::bits; }
+	bool is_str() const { return tag == backing_tag::string; }
+
+	bitvectype* get_if_bits() const { return is_bits() ? &bits_ : NULL; }
+	std::string* get_if_str() const { return is_str() ? &str_ : NULL; }
+
+	bitvectype& get_bits() const;
+	std::string& get_str() const;
+public:
+	Const() : flags(RTLIL::CONST_FLAG_NONE), tag(backing_tag::bits), bits_(std::vector<RTLIL::State>()) {}
 	Const(const std::string &str);
-	Const(int val, int width = 32);
+	Const(long long val, int width = 32);
 	Const(RTLIL::State bit, int width = 1);
-	Const(const std::vector<RTLIL::State> &bits) : bits(bits) { flags = CONST_FLAG_NONE; }
+	Const(const std::vector<RTLIL::State> &bits) : flags(RTLIL::CONST_FLAG_NONE), tag(backing_tag::bits), bits_(bits) {}
 	Const(const std::vector<bool> &bits);
-	Const(const RTLIL::Const &c) = default;
-	RTLIL::Const &operator =(const RTLIL::Const &other) = default;
+	Const(const RTLIL::Const &other);
+	Const(RTLIL::Const &&other);
+	RTLIL::Const &operator =(const RTLIL::Const &other);
+	~Const();
 
 	bool operator <(const RTLIL::Const &other) const;
 	bool operator ==(const RTLIL::Const &other) const;
 	bool operator !=(const RTLIL::Const &other) const;
 
+	std::vector<RTLIL::State>& bits();
 	bool as_bool() const;
 	int as_int(bool is_signed = false) const;
-	std::string as_string() const;
+	std::string as_string(const char* any = "-") const;
 	static Const from_string(const std::string &str);
+	std::vector<RTLIL::State> to_bits() const;
 
 	std::string decode_string() const;
+	int size() const;
+	bool empty() const;
+	void bitvectorize() const;
 
-	inline int size() const { return bits.size(); }
-	inline bool empty() const { return bits.empty(); }
-	inline RTLIL::State &operator[](int index) { return bits.at(index); }
-	inline const RTLIL::State &operator[](int index) const { return bits.at(index); }
-	inline decltype(bits)::iterator begin() { return bits.begin(); }
-	inline decltype(bits)::iterator end() { return bits.end(); }
+	class const_iterator {
+	private:
+		const Const& parent;
+		size_t idx;
+
+	public:
+		using iterator_category = std::input_iterator_tag;
+		using value_type = State;
+		using difference_type = std::ptrdiff_t;
+		using pointer = const State*;
+		using reference = const State&;
+
+		const_iterator(const Const& c, size_t i) : parent(c), idx(i) {}
+
+		State operator*() const;
+
+		const_iterator& operator++() { ++idx; return *this; }
+		const_iterator& operator--() { --idx; return *this; }
+		const_iterator& operator++(int) { ++idx; return *this; }
+		const_iterator& operator--(int) { --idx; return *this; }
+		const_iterator& operator+=(int i) { idx += i; return *this; }
+
+		const_iterator operator+(int add) {
+			return const_iterator(parent, idx + add);
+		}
+		const_iterator operator-(int sub) {
+			return const_iterator(parent, idx - sub);
+		}
+		int operator-(const const_iterator& other) {
+			return idx - other.idx;
+		}
+
+		bool operator==(const const_iterator& other) const {
+			return idx == other.idx;
+		}
+
+		bool operator!=(const const_iterator& other) const {
+			return !(*this == other);
+		}
+	};
+
+	const_iterator begin() const {
+		return const_iterator(*this, 0);
+	}
+	const_iterator end() const {
+		return const_iterator(*this, size());
+	}
+	State back() const {
+		return *(end() - 1);
+	}
+	State front() const {
+		return *begin();
+	}
+	State at(size_t i) const {
+		return *const_iterator(*this, i);
+	}
+	State operator[](size_t i) const {
+		return *const_iterator(*this, i);
+	}
 
 	bool is_fully_zero() const;
 	bool is_fully_ones() const;
@@ -694,25 +783,29 @@ struct RTLIL::Const
 	bool is_fully_undef_x_only() const;
 	bool is_onehot(int *pos = nullptr) const;
 
-	inline RTLIL::Const extract(int offset, int len = 1, RTLIL::State padding = RTLIL::State::S0) const {
-		RTLIL::Const ret;
-		ret.bits.reserve(len);
-		for (int i = offset; i < offset + len; i++)
-			ret.bits.push_back(i < GetSize(bits) ? bits[i] : padding);
-		return ret;
-	}
+	RTLIL::Const extract(int offset, int len = 1, RTLIL::State padding = RTLIL::State::S0) const;
+
+	// find the MSB without redundant leading bits
+	size_t get_min_size(bool is_signed) const;
+
+	// compress representation to the minimum required bits
+	void compress(bool is_signed = false);
+
+	std::optional<int> as_int_compress(bool is_signed) const;
 
 	void extu(int width) {
-		bits.resize(width, RTLIL::State::S0);
+		bits().resize(width, RTLIL::State::S0);
 	}
 
 	void exts(int width) {
-		bits.resize(width, bits.empty() ? RTLIL::State::Sx : bits.back());
+		bitvectype& bv = bits();
+		bv.resize(width, bv.empty() ? RTLIL::State::Sx : bv.back());
 	}
 
 	inline unsigned int hash() const {
 		unsigned int h = mkhash_init;
-		for (auto b : bits)
+
+		for (State b : *this)
 			h = mkhash(h, b);
 		return h;
 	}
@@ -759,8 +852,8 @@ struct RTLIL::SigChunk
 	int width, offset;
 
 	SigChunk() : wire(nullptr), width(0), offset(0) {}
-	SigChunk(const RTLIL::Const &value) : wire(nullptr), data(value.bits), width(GetSize(data)), offset(0) {}
-	SigChunk(RTLIL::Const &&value) : wire(nullptr), data(std::move(value.bits)), width(GetSize(data)), offset(0) {}
+	SigChunk(const RTLIL::Const &value) : wire(nullptr), data(value.to_bits()), width(GetSize(data)), offset(0) {}
+	SigChunk(RTLIL::Const &&value) : wire(nullptr), data(value.to_bits()), width(GetSize(data)), offset(0) {}
 	SigChunk(RTLIL::Wire *wire) : wire(wire), width(GetSize(wire)), offset(0) {}
 	SigChunk(RTLIL::Wire *wire, int offset, int width = 1) : wire(wire), width(width), offset(offset) {}
 	SigChunk(const std::string &str) : SigChunk(RTLIL::Const(str)) {}
@@ -769,6 +862,7 @@ struct RTLIL::SigChunk
 	SigChunk(const RTLIL::SigBit &bit);
 
 	RTLIL::SigChunk extract(int offset, int length) const;
+	RTLIL::SigBit operator[](int offset) const;
 	inline int size() const { return width; }
 	inline bool is_wire() const { return wire != NULL; }
 
@@ -1064,6 +1158,9 @@ struct RTLIL::Design
 	pool<RTLIL::Monitor*> monitors;
 	dict<std::string, std::string> scratchpad;
 
+	bool flagBufferedNormalized = false;
+	void bufNormalize(bool enable=true);
+
 	int refcount_modules_;
 	dict<RTLIL::IdString, RTLIL::Module*> modules_;
 	std::vector<RTLIL::Binding*> bindings_;
@@ -1208,6 +1305,9 @@ public:
 	std::vector<RTLIL::IdString> ports;
 	void fixup_ports();
 
+	pool<pair<RTLIL::Cell*, RTLIL::IdString>> bufNormQueue;
+	void bufNormalize();
+
 	template<typename T> void rewrite_sigspecs(T &functor);
 	template<typename T> void rewrite_sigspecs2(T &functor);
 	void cloneInto(RTLIL::Module *new_mod) const;
@@ -1279,6 +1379,7 @@ public:
 
 	RTLIL::Cell* addNot (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_y, bool is_signed = false, const std::string &src = "");
 	RTLIL::Cell* addPos (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_y, bool is_signed = false, const std::string &src = "");
+	RTLIL::Cell* addBuf (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_y, bool is_signed = false, const std::string &src = "");
 	RTLIL::Cell* addNeg (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_y, bool is_signed = false, const std::string &src = "");
 
 	RTLIL::Cell* addAnd  (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_y, bool is_signed = false, const std::string &src = "");
@@ -1413,6 +1514,7 @@ public:
 
 	RTLIL::SigSpec Not (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, bool is_signed = false, const std::string &src = "");
 	RTLIL::SigSpec Pos (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, bool is_signed = false, const std::string &src = "");
+	RTLIL::SigSpec Buf (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, bool is_signed = false, const std::string &src = "");
 	RTLIL::SigSpec Neg (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, bool is_signed = false, const std::string &src = "");
 
 	RTLIL::SigSpec And  (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, bool is_signed = false, const std::string &src = "");
@@ -1500,6 +1602,10 @@ public:
 #endif
 };
 
+namespace RTLIL_BACKEND {
+void dump_wire(std::ostream &f, std::string indent, const RTLIL::Wire *wire);
+}
+
 struct RTLIL::Wire : public RTLIL::AttrObject
 {
 	unsigned int hashidx_;
@@ -1511,6 +1617,12 @@ protected:
 	Wire();
 	~Wire();
 
+	friend struct RTLIL::Design;
+	friend struct RTLIL::Cell;
+	friend void RTLIL_BACKEND::dump_wire(std::ostream &f, std::string indent, const RTLIL::Wire *wire);
+	RTLIL::Cell *driverCell_ = nullptr;
+	RTLIL::IdString driverPort_;
+
 public:
 	// do not simply copy wires
 	Wire(RTLIL::Wire &other) = delete;
@@ -1520,6 +1632,9 @@ public:
 	RTLIL::IdString name;
 	int width, start_offset, port_id;
 	bool port_input, port_output, upto, is_signed;
+
+	RTLIL::Cell *driverCell() const    { log_assert(driverCell_); return driverCell_; };
+	RTLIL::IdString driverPort() const { log_assert(driverCell_); return driverPort_; };
 
 #ifdef WITH_PYTHON
 	static std::map<unsigned int, RTLIL::Wire*> *get_all_wires(void);

@@ -30,6 +30,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <initializer_list>
+#include <variant>
+#include <optional>
 #include <stdexcept>
 #include <memory>
 #include <cmath>
@@ -59,6 +61,9 @@
          When building Yosys with a custom make system, make sure you set all the \
          defines the Yosys Makefile would set for your build configuration.
 #endif
+
+#define FRIEND_TEST(test_case_name, test_name) \
+  friend class test_case_name##_##test_name##_Test
 
 #ifdef YOSYS_ENABLE_TCL
 #  include <tcl.h>
